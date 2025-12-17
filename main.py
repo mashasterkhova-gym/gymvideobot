@@ -1,10 +1,11 @@
 import os
 import json
 import time
-import random
-from typing import Dict, List, Optional
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
+
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -19,6 +20,7 @@ from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -36,12 +38,12 @@ GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip
 PAY_1M_URL = os.getenv("PAY_1M_URL", "https://getcourse.ru/").strip()
 PAY_3M_URL = os.getenv("PAY_3M_URL", "https://getcourse.ru/").strip()
 STRETCH_URL = os.getenv("STRETCH_URL", "").strip()
+
+# Image: prefer local file, fallback to URL
+MUSCLE_IMAGE_PATH = os.getenv("MUSCLE_IMAGE_PATH", "muscles.png").strip()
 MUSCLE_IMAGE_URL = os.getenv("MUSCLE_IMAGE_URL", "").strip()
 
-# ========= CONSTANTS =========
-FREE_LIMIT = 3
-USER_USAGE: Dict[int, int] = {}
-
+# ========= UI TEXT =========
 BTN_FIND_VIDEO = "🔎 Найти видео"
 BTN_REPLACE = "🔁 Заменить упражнение"
 BTN_PAY_1M = "💳 Оплатить клуб на 1 месяц"
@@ -50,6 +52,17 @@ BTN_PAY_3M = "💳 Оплатить клуб на 3 месяца"
 MODE_FIND = "find"
 MODE_REPLACE = "replace"
 
+# ========= LIMITS =========
+FREE_LIMIT = 3
+USER_USAGE: Dict[int, int] = {}  # in-memory counters (OK for MVP)
+
+LIMIT_MESSAGE = (
+    "Больше видео доступно только для участниц сообщества.\n"
+    "Доступ к сообществу можно оплатить в боте.\n"
+    "А пока — порадуй себя мягкой растяжкой от нашего тренера 💛\n"
+)
+
+# ========= MUSCLES =========
 ALLOWED_MUSCLES = [
     "Грудные (верх)", "Грудные (середина)", "Грудные (низ)", "Грудные (весь блок)",
     "Спина (широчайшие)", "Спина (глубокий слой)", "Спина (разгибатели)",
@@ -61,20 +74,41 @@ ALLOWED_MUSCLES = [
     "Внутренняя поверхность бедра", "Ягодицы", "Ротаторы бедра",
 ]
 
-# ========= HELPERS =========
+# ========= Google Sheet cache =========
+CACHE_TTL_SEC = 60
+_sheet_cache = {"ts": 0.0, "rows": []}
+
+
 def _norm(s: str) -> str:
     return (s or "").strip().lower()
 
-def main_keyboard():
+
+def _require_env() -> None:
+    missing = []
+    if not BOT_TOKEN:
+        missing.append("BOT_TOKEN")
+    if not GROUP_CHAT:
+        missing.append("GROUP_CHAT")
+    if not SHEET_ID:
+        missing.append("SHEET_ID")
+    if not GOOGLE_SERVICE_ACCOUNT_JSON:
+        missing.append("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if missing:
+        raise RuntimeError(f"Missing env vars: {', '.join(missing)}")
+
+
+def main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton(BTN_FIND_VIDEO), KeyboardButton(BTN_REPLACE)],
             [KeyboardButton(BTN_PAY_1M), KeyboardButton(BTN_PAY_3M)],
         ],
         resize_keyboard=True,
+        one_time_keyboard=False,
     )
 
-def payment_kb():
+
+def pay_buttons() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("Оплатить 1 месяц", url=PAY_1M_URL)],
@@ -82,180 +116,308 @@ def payment_kb():
         ]
     )
 
-def limit_text() -> str:
-    base = (
-        "Больше видео доступно только для участниц сообщества.\n"
-        "Доступ к сообществу можно оплатить в боте.\n"
-        "А пока — порадуй себя мягкой растяжкой от нашего тренера 💛\n"
-    )
-    return base + (STRETCH_URL if STRETCH_URL else "")
 
-# ========= ACCESS =========
-async def is_member(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+def get_usage(user_id: int) -> int:
+    return int(USER_USAGE.get(user_id, 0))
+
+
+def inc_usage(user_id: int) -> None:
+    USER_USAGE[user_id] = get_usage(user_id) + 1
+
+
+def limit_reached(is_member: bool, user_id: int) -> bool:
+    return (not is_member) and (get_usage(user_id) >= FREE_LIMIT)
+
+
+def limit_text() -> str:
+    return LIMIT_MESSAGE + (STRETCH_URL or "")
+
+
+async def is_member_of_group(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     try:
-        m = await context.bot.get_chat_member(GROUP_CHAT, user_id)
+        m = await context.bot.get_chat_member(chat_id=GROUP_CHAT, user_id=user_id)
         return m.status in ("member", "administrator", "creator")
     except Exception:
         return False
 
-def limit_reached(user_id: int, member: bool) -> bool:
-    return False if member else USER_USAGE.get(user_id, 0) >= FREE_LIMIT
 
-def inc_usage(user_id: int):
-    USER_USAGE[user_id] = USER_USAGE.get(user_id, 0) + 1
-
-# ========= GOOGLE SHEETS (cached) =========
-_CACHE_TTL = 60
-_cache = {"ts": 0.0, "rows": []}
-
-def get_sheet_rows() -> List[dict]:
-    now = time.time()
-    if _cache["rows"] and (now - _cache["ts"] < _CACHE_TTL):
-        return _cache["rows"]
-
+def _get_gspread_client() -> gspread.Client:
+    info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
     creds = Credentials.from_service_account_info(
-        json.loads(GOOGLE_SERVICE_ACCOUNT_JSON),
+        info,
         scopes=[
             "https://www.googleapis.com/auth/spreadsheets.readonly",
             "https://www.googleapis.com/auth/drive.readonly",
         ],
     )
-    client = gspread.authorize(creds)
-    sh = client.open_by_key(SHEET_ID)
+    return gspread.authorize(creds)
+
+
+def get_rows_from_sheet() -> List[Dict[str, str]]:
+    now = time.time()
+    if _sheet_cache["rows"] and (now - _sheet_cache["ts"] < CACHE_TTL_SEC):
+        return _sheet_cache["rows"]
+
+    gc = _get_gspread_client()
+    sh = gc.open_by_key(SHEET_ID)
 
     try:
         ws = sh.worksheet(WORKSHEET_NAME)
     except Exception:
         ws = sh.get_worksheet(0)
 
-    rows = ws.get_all_records()
-    _cache["rows"] = rows
-    _cache["ts"] = now
+    records = ws.get_all_records()
+    rows = []
+    for r in records:
+        rows.append(
+            {
+                "exercise": str(r.get("exercise", "")).strip(),
+                "url": str(r.get("url", "")).strip(),
+                "primary_muscle": str(r.get("primary_muscle", "")).strip(),
+                "secondary_muscle": str(r.get("secondary_muscle", "")).strip(),
+            }
+        )
+
+    _sheet_cache["rows"] = rows
+    _sheet_cache["ts"] = now
     return rows
 
-def find_muscle_from_text(text: str) -> Optional[str]:
-    q = _norm(text)
+
+def search_by_exercise(query: str) -> List[Dict[str, str]]:
+    q = _norm(query)
     if not q:
-        return None
-    # exact first
-    for m in ALLOWED_MUSCLES:
-        if _norm(m) == q:
-            return m
-    # partial
+        return []
+    rows = get_rows_from_sheet()
+    return [r for r in rows if q in _norm(r["exercise"])]
+
+
+def resolve_muscle(user_text: str) -> Tuple[str, Optional[str], List[str]]:
+    q = _norm(user_text)
+    if not q:
+        return ("none", None, [])
+
+    exact = [m for m in ALLOWED_MUSCLES if _norm(m) == q]
+    if exact:
+        return ("exact", exact[0], [])
+
     candidates = [m for m in ALLOWED_MUSCLES if q in _norm(m)]
     if len(candidates) == 1:
-        return candidates[0]
-    return None
+        return ("exact", candidates[0], [])
+    if len(candidates) > 1:
+        return ("many", None, candidates[:30])
+    return ("none", None, [])
 
-# ========= HANDLERS =========
+
+def search_by_muscle(muscle: str) -> List[Dict[str, str]]:
+    m = _norm(muscle)
+    rows = get_rows_from_sheet()
+    return [r for r in rows if _norm(r["primary_muscle"]) == m]
+
+
+def _format_item(r: Dict[str, str]) -> str:
+    ex = r.get("exercise", "") or "Без названия"
+    url = r.get("url", "")
+    pm = r.get("primary_muscle", "")
+    sm = r.get("secondary_muscle", "")
+    line = f"• {ex}"
+    if url:
+        line += f"\n{url}"
+    tags = " — ".join([x for x in [pm, sm] if x])
+    if tags:
+        line += f"\n{tags}"
+    return line
+
+
+async def send_muscle_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("Выбери нужную мышцу 👇")
+
+    path = Path(MUSCLE_IMAGE_PATH)
+    try:
+        if path.exists():
+            with path.open("rb") as f:
+                await update.message.reply_photo(photo=f)
+        elif MUSCLE_IMAGE_URL:
+            await update.message.reply_photo(photo=MUSCLE_IMAGE_URL)
+        else:
+            await update.message.reply_text("Картинка пока не настроена 😿")
+    except Exception:
+        if MUSCLE_IMAGE_URL:
+            await update.message.reply_text(f"Не смогла показать картинку, вот ссылка:\n{MUSCLE_IMAGE_URL}")
+        else:
+            await update.message.reply_text("Не смогла показать картинку 😿")
+
+    await update.message.reply_text("Напиши мышцу текстом (можно часть слова, например: `ягод` или `дельта`).")
+
+
+def muscle_page_keyboard(muscle: str, page: int, total: int, page_size: int) -> InlineKeyboardMarkup:
+    max_page = max(0, (total - 1) // page_size)
+    buttons = []
+    row = []
+    if page > 0:
+        row.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"m:{muscle}:{page-1}"))
+    if page < max_page:
+        row.append(InlineKeyboardButton("➡️ Дальше", callback_data=f"m:{muscle}:{page+1}"))
+    if row:
+        buttons.append(row)
+    return InlineKeyboardMarkup(buttons) if buttons else InlineKeyboardMarkup([])
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text("Выбирай действие 👇", reply_markup=main_keyboard())
+    await update.message.reply_text("Привет! 👋 Выбирай действие:", reply_markup=main_keyboard())
+
+
+async def send_muscle_page(update: Update, context: ContextTypes.DEFAULT_TYPE, muscle: str, page: int, edit: bool):
+    items: List[Dict[str, str]] = context.user_data.get("last_items", [])
+    page_size: int = int(context.user_data.get("page_size", 15))
+    total = len(items)
+
+    start_i = page * page_size
+    end_i = start_i + page_size
+    slice_items = items[start_i:end_i]
+
+    header = f"Видео по мышце «{muscle}» — всего {total}. Страница {page+1}.\n\n"
+    body = header + "\n\n".join([_format_item(r) for r in slice_items])
+
+    kb = muscle_page_keyboard(muscle=muscle, page=page, total=total, page_size=page_size)
+
+    if edit and update.callback_query:
+        await update.callback_query.edit_message_text(body, reply_markup=kb)
+    else:
+        await update.message.reply_text(body, reply_markup=kb)
+
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     user_id = update.effective_user.id
-    member = await is_member(user_id, context)
+    member = await is_member_of_group(user_id, context)
 
-    # Payment (never counted)
-    if text in (BTN_PAY_1M, BTN_PAY_3M):
-        await update.message.reply_text("Оплата доступа 👇", reply_markup=payment_kb())
+    # Payment buttons never count
+    if text == BTN_PAY_1M:
+        await update.message.reply_text("Оплата за 1 месяц 👇", reply_markup=pay_buttons())
+        return
+    if text == BTN_PAY_3M:
+        await update.message.reply_text("Оплата за 3 месяца 👇", reply_markup=pay_buttons())
         return
 
-    # Buttons
+    # Menu actions
     if text == BTN_FIND_VIDEO:
-        if limit_reached(user_id, member):
-            await update.message.reply_text(limit_text(), reply_markup=payment_kb())
+        if limit_reached(member, user_id):
+            await update.message.reply_text(limit_text(), reply_markup=pay_buttons())
             return
         context.user_data["mode"] = MODE_FIND
-        await update.message.reply_text("Напиши название упражнения (или часть) 👇")
+        await update.message.reply_text("Ок! Напиши название (или часть названия) упражнения 👇")
         return
 
     if text == BTN_REPLACE:
-        if limit_reached(user_id, member):
-            await update.message.reply_text(limit_text(), reply_markup=payment_kb())
+        if limit_reached(member, user_id):
+            await update.message.reply_text(limit_text(), reply_markup=pay_buttons())
             return
         context.user_data["mode"] = MODE_REPLACE
-        await update.message.reply_text("Выбери нужную мышцу 👇")
-
-        # try send image, fallback to sending link
-        try:
-            if MUSCLE_IMAGE_URL:
-                await update.message.reply_photo(MUSCLE_IMAGE_URL)
-            else:
-                await update.message.reply_text("Картинка не настроена (MUSCLE_IMAGE_URL пуст).")
-        except Exception:
-            await update.message.reply_text(
-                "Не смогла показать картинку 😿 Вот ссылка на неё:\n" + MUSCLE_IMAGE_URL
-            )
+        await send_muscle_prompt(update, context)
         return
 
-    # Modes
     mode = context.user_data.get("mode")
-    rows = get_sheet_rows()
 
     if mode == MODE_FIND:
-        if limit_reached(user_id, member):
-            await update.message.reply_text(limit_text(), reply_markup=payment_kb())
+        if limit_reached(member, user_id):
+            await update.message.reply_text(limit_text(), reply_markup=pay_buttons())
             return
 
         inc_usage(user_id)
-        q = _norm(text)
-        results = [r for r in rows if q and q in _norm(str(r.get("exercise", "")))]
+
+        results = search_by_exercise(text)
         if not results:
-            await update.message.reply_text("Не нашла 😿 Попробуй короче/по-другому.")
+            await update.message.reply_text("Не нашла 😿 Попробуй другое слово или короче запрос.")
             return
 
-        msg = "\n\n".join(
-            f"• {r.get('exercise','')}\n{r.get('url','')}\n{r.get('primary_muscle','')}"
-            for r in results[:10]
-        )
-        await update.message.reply_text(msg)
+        await update.message.reply_text("Нашла вот что 👇")
+        # first 30 results in a few messages
+        lines = [_format_item(r) for r in results[:30]]
+        chunk = []
+        size = 0
+        for line in lines:
+            piece = line + "\n\n"
+            if size + len(piece) > 3500 and chunk:
+                await update.message.reply_text("".join(chunk).strip())
+                chunk, size = [], 0
+            chunk.append(piece)
+            size += len(piece)
+        if chunk:
+            await update.message.reply_text("".join(chunk).strip())
         return
 
     if mode == MODE_REPLACE:
-        if limit_reached(user_id, member):
-            await update.message.reply_text(limit_text(), reply_markup=payment_kb())
+        if limit_reached(member, user_id):
+            await update.message.reply_text(limit_text(), reply_markup=pay_buttons())
             return
 
-        muscle = find_muscle_from_text(text)
-        if not muscle:
-            await update.message.reply_text(
-                "Не поняла мышцу 😿\n"
-                "Напиши точнее (например: `Ягодицы`, `Средняя дельта`, `Верх трапеции`)."
-            )
+        kind, muscle, candidates = resolve_muscle(text)
+
+        if kind == "none":
+            await update.message.reply_text("Не поняла мышцу 😿 Попробуй ещё раз (например: `Ягодицы`, `Средняя дельта`).")
             return
 
+        if kind == "many":
+            suggest = "\n".join([f"• {m}" for m in candidates])
+            await update.message.reply_text("Нашла несколько вариантов — скопируй один из списка:\n\n" + suggest)
+            return
+
+        # exact muscle counts as a request
         inc_usage(user_id)
 
-        # match by normalized equality with primary_muscle in sheet
-        mnorm = _norm(muscle)
-        options = [r for r in rows if _norm(str(r.get("primary_muscle", ""))) == mnorm]
-
-        if not options:
+        items = search_by_muscle(muscle or "")
+        if not items:
             await update.message.reply_text(f"По мышце «{muscle}» пока нет видео 😿")
             return
 
-        pick = random.choice(options)
-        await update.message.reply_text(
-            f"Вот вариант замены 👇\n\n• {pick.get('exercise','')}\n{pick.get('url','')}"
-        )
+        # Save for paging
+        context.user_data["last_muscle"] = muscle
+        context.user_data["last_items"] = items
+        context.user_data["page_size"] = 15
+
+        await send_muscle_page(update, context, muscle=muscle, page=0, edit=False)
         return
 
-    await update.message.reply_text("Выбери действие кнопкой 👇", reply_markup=main_keyboard())
+    await update.message.reply_text("Сначала выбери действие кнопкой 👇", reply_markup=main_keyboard())
 
-# ========= RUN =========
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    data = q.data or ""
+    if not data.startswith("m:"):
+        return
+
+    try:
+        _, muscle, page_str = data.split(":", 2)
+        page = int(page_str)
+    except Exception:
+        return
+
+    last_muscle = context.user_data.get("last_muscle")
+    if last_muscle != muscle:
+        context.user_data["last_muscle"] = muscle
+        context.user_data["last_items"] = search_by_muscle(muscle)
+
+    await send_muscle_page(update, context, muscle=muscle, page=page, edit=True)
+
+
 async def post_init(app: Application):
-    # important: clear webhook and pending updates to avoid weird conflicts/stale updates
+    # Clear webhook & pending updates to avoid stuck states
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
     except Exception as e:
         print(f"delete_webhook failed: {repr(e)}", flush=True)
 
+
 def run():
+    _require_env()
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     print("Bot is running...", flush=True)
