@@ -121,7 +121,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # --- Find video
-    ifROWS = get_sheet_rows()
+    ROWS = get_sheet_rows()
 
     if text == BTN_FIND_VIDEO:
         if limit_reached(user_id, member):
