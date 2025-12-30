@@ -43,6 +43,11 @@ STRETCH_URL = os.getenv("STRETCH_URL", "").strip()
 MUSCLE_IMAGE_PATH = os.getenv("MUSCLE_IMAGE_PATH", "muscles.png").strip()
 MUSCLE_IMAGE_URL = os.getenv("MUSCLE_IMAGE_URL", "").strip()
 
+# Optional: column names in Google Sheet (defaults match our bot)
+COL_EXERCISE = os.getenv("COL_EXERCISE", "exercise").strip()
+COL_URL = os.getenv("COL_URL", "url").strip()
+COL_MUSCLES = os.getenv("COL_MUSCLES", "primary_muscle").strip()  # muscles in one cell, comma-separated
+
 # ========= UI TEXT =========
 BTN_FIND_VIDEO = "🔎 Найти видео"
 BTN_REPLACE = "🔁 Заменить упражнение"
@@ -54,7 +59,7 @@ MODE_REPLACE = "replace"
 
 # ========= LIMITS =========
 FREE_LIMIT = 3
-USER_USAGE: Dict[int, int] = {}  # in-memory counters (OK for MVP)
+USER_USAGE: Dict[int, int] = {}  # in-memory counters (MVP)
 
 LIMIT_MESSAGE = (
     "Больше видео доступно только для участниц сообщества.\n"
@@ -62,7 +67,7 @@ LIMIT_MESSAGE = (
     "А пока — порадуй себя мягкой растяжкой от нашего тренера 💛\n"
 )
 
-# ========= MUSCLES =========
+# ========= MUSCLES LIST (your canonical list) =========
 ALLOWED_MUSCLES = [
     "Грудные (верх)", "Грудные (середина)", "Грудные (низ)", "Грудные (весь блок)",
     "Спина (широчайшие)", "Спина (глубокий слой)", "Спина (разгибатели)",
@@ -73,6 +78,14 @@ ALLOWED_MUSCLES = [
     "Квадрицепсы", "Хамстринги", "Сгибатели бедра",
     "Внутренняя поверхность бедра", "Ягодицы", "Ротаторы бедра",
 ]
+
+# aliases to be more forgiving (optional but helps with "Ягодица"/"Широчайшие"/"Разгибатели")
+ALIASES = {
+    "ягодица": "ягодицы",
+    "ягодицы": "ягодицы",
+    "широчайшие": "спина (широчайшие)",
+    "разгибатели": "спина (разгибатели)",
+}
 
 # ========= Google Sheet cache =========
 CACHE_TTL_SEC = 60
@@ -167,20 +180,68 @@ def get_rows_from_sheet() -> List[Dict[str, str]]:
         ws = sh.get_worksheet(0)
 
     records = ws.get_all_records()
-    rows = []
+    rows: List[Dict[str, str]] = []
     for r in records:
         rows.append(
             {
-                "exercise": str(r.get("exercise", "")).strip(),
-                "url": str(r.get("url", "")).strip(),
-                "primary_muscle": str(r.get("primary_muscle", "")).strip(),
-                "secondary_muscle": str(r.get("secondary_muscle", "")).strip(),
+                "exercise": str(r.get(COL_EXERCISE, "")).strip(),
+                "url": str(r.get(COL_URL, "")).strip(),
+                "muscles": str(r.get(COL_MUSCLES, "")).strip(),  # comma-separated in one cell
             }
         )
 
     _sheet_cache["rows"] = rows
     _sheet_cache["ts"] = now
     return rows
+
+
+def split_muscles(cell_value: str) -> List[str]:
+    """
+    'Передняя дельта, Разгибатели, Хамстринги'
+    -> ['передняя дельта', 'разгибатели', 'хамстринги']
+    """
+    if not cell_value:
+        return []
+    return [_norm(x) for x in str(cell_value).split(",") if x.strip()]
+
+
+def canonical_keys(muscle: str) -> List[str]:
+    """
+    Makes matching tolerant:
+    - 'Спина (разгибатели)' -> ['спина (разгибатели)', 'разгибатели']
+    - 'Средняя трапеция' -> ['средняя трапеция']
+    """
+    m = _norm(muscle)
+    keys = [m]
+    if "(" in m and ")" in m:
+        inside = m.split("(", 1)[1].split(")", 1)[0].strip()
+        if inside:
+            keys.append(inside)
+    # alias mapping (optional)
+    if m in ALIASES:
+        keys.append(_norm(ALIASES[m]))
+    return list(dict.fromkeys([k for k in keys if k]))
+
+
+def muscles_match(target_muscle: str, cell_value: str) -> bool:
+    """
+    Match if ANY muscle from the cell matches target:
+    - exact
+    - substring either direction
+    - with keys from canonical (handles '(...)' part)
+    """
+    cell_items = split_muscles(cell_value)
+    if not cell_items:
+        return False
+
+    keys = canonical_keys(target_muscle)
+    for item in cell_items:
+        # apply alias for item too
+        item2 = _norm(ALIASES.get(item, item))
+        for k in keys:
+            if item2 == k or k in item2 or item2 in k:
+                return True
+    return False
 
 
 def search_by_exercise(query: str) -> List[Dict[str, str]]:
@@ -191,41 +252,46 @@ def search_by_exercise(query: str) -> List[Dict[str, str]]:
     return [r for r in rows if q in _norm(r["exercise"])]
 
 
-def resolve_muscle(user_text: str) -> Tuple[str, Optional[str], List[str]]:
+def resolve_muscle(user_text: str) -> Tuple[str, Optional[int], List[str]]:
+    """
+    Returns:
+      ("exact", idx, [])
+      ("many", None, candidates)
+      ("none", None, [])
+    """
     q = _norm(user_text)
     if not q:
         return ("none", None, [])
 
-    exact = [m for m in ALLOWED_MUSCLES if _norm(m) == q]
-    if exact:
-        return ("exact", exact[0], [])
+    # exact by canonical list
+    for i, m in enumerate(ALLOWED_MUSCLES):
+        if _norm(m) == q:
+            return ("exact", i, [])
 
-    candidates = [m for m in ALLOWED_MUSCLES if q in _norm(m)]
+    # partial matches by canonical list
+    candidates = [(i, m) for i, m in enumerate(ALLOWED_MUSCLES) if q in _norm(m)]
     if len(candidates) == 1:
-        return ("exact", candidates[0], [])
+        return ("exact", candidates[0][0], [])
     if len(candidates) > 1:
-        return ("many", None, candidates[:30])
+        return ("many", None, [m for _, m in candidates[:30]])
     return ("none", None, [])
 
 
-def search_by_muscle(muscle: str) -> List[Dict[str, str]]:
-    m = _norm(muscle)
+def search_by_muscle(canonical_muscle: str) -> List[Dict[str, str]]:
     rows = get_rows_from_sheet()
-    return [r for r in rows if _norm(r["primary_muscle"]) == m]
+    return [r for r in rows if muscles_match(canonical_muscle, r.get("muscles", ""))]
 
 
-def _format_item(r: Dict[str, str]) -> str:
+def format_item(r: Dict[str, str]) -> str:
     ex = r.get("exercise", "") or "Без названия"
     url = r.get("url", "")
-    pm = r.get("primary_muscle", "")
-    sm = r.get("secondary_muscle", "")
-    line = f"• {ex}"
+    muscles = r.get("muscles", "")
+    out = f"• {ex}"
     if url:
-        line += f"\n{url}"
-    tags = " — ".join([x for x in [pm, sm] if x])
-    if tags:
-        line += f"\n{tags}"
-    return line
+        out += f"\n{url}"
+    if muscles:
+        out += f"\n{muscles}"
+    return out
 
 
 async def send_muscle_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -249,25 +315,27 @@ async def send_muscle_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text("Напиши мышцу текстом (можно часть слова, например: `ягод` или `дельта`).")
 
 
-def muscle_page_keyboard(muscle: str, page: int, total: int, page_size: int) -> InlineKeyboardMarkup:
+def page_keyboard(idx: int, page: int, total: int, page_size: int) -> InlineKeyboardMarkup:
     max_page = max(0, (total - 1) // page_size)
     buttons = []
     row = []
     if page > 0:
-        row.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"m:{muscle}:{page-1}"))
+        row.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"m:{idx}:{page-1}"))
     if page < max_page:
-        row.append(InlineKeyboardButton("➡️ Дальше", callback_data=f"m:{muscle}:{page+1}"))
+        row.append(InlineKeyboardButton("➡️ Дальше", callback_data=f"m:{idx}:{page+1}"))
     if row:
         buttons.append(row)
     return InlineKeyboardMarkup(buttons) if buttons else InlineKeyboardMarkup([])
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    await update.message.reply_text("Привет! 👋 Выбирай действие:", reply_markup=main_keyboard())
-
-
-async def send_muscle_page(update: Update, context: ContextTypes.DEFAULT_TYPE, muscle: str, page: int, edit: bool):
+async def send_muscle_page(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    idx: int,
+    page: int,
+    edit: bool,
+):
+    muscle = ALLOWED_MUSCLES[idx]
     items: List[Dict[str, str]] = context.user_data.get("last_items", [])
     page_size: int = int(context.user_data.get("page_size", 15))
     total = len(items)
@@ -277,14 +345,20 @@ async def send_muscle_page(update: Update, context: ContextTypes.DEFAULT_TYPE, m
     slice_items = items[start_i:end_i]
 
     header = f"Видео по мышце «{muscle}» — всего {total}. Страница {page+1}.\n\n"
-    body = header + "\n\n".join([_format_item(r) for r in slice_items])
+    body = header + "\n\n".join([format_item(r) for r in slice_items])
 
-    kb = muscle_page_keyboard(muscle=muscle, page=page, total=total, page_size=page_size)
+    kb = page_keyboard(idx=idx, page=page, total=total, page_size=page_size)
 
     if edit and update.callback_query:
         await update.callback_query.edit_message_text(body, reply_markup=kb)
     else:
         await update.message.reply_text(body, reply_markup=kb)
+
+
+# ========= HANDLERS =========
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("Привет! 👋 Выбирай действие:", reply_markup=main_keyboard())
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -332,10 +406,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         await update.message.reply_text("Нашла вот что 👇")
-        # first 30 results in a few messages
-        lines = [_format_item(r) for r in results[:30]]
-        chunk = []
-        size = 0
+        # send up to 30 results in chunks
+        lines = [format_item(r) for r in results[:30]]
+        chunk, size = [], 0
         for line in lines:
             piece = line + "\n\n"
             if size + len(piece) > 3500 and chunk:
@@ -352,10 +425,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(limit_text(), reply_markup=pay_buttons())
             return
 
-        kind, muscle, candidates = resolve_muscle(text)
+        kind, idx, candidates = resolve_muscle(text)
 
         if kind == "none":
-            await update.message.reply_text("Не поняла мышцу 😿 Попробуй ещё раз (например: `Ягодицы`, `Средняя дельта`).")
+            await update.message.reply_text(
+                "Не поняла мышцу 😿\n"
+                "Попробуй ещё раз (например: `Ягодицы`, `Средняя дельта`, `Спина (разгибатели)`)."
+            )
             return
 
         if kind == "many":
@@ -364,19 +440,21 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # exact muscle counts as a request
+        assert idx is not None
         inc_usage(user_id)
 
-        items = search_by_muscle(muscle or "")
+        muscle = ALLOWED_MUSCLES[idx]
+        items = search_by_muscle(muscle)
         if not items:
             await update.message.reply_text(f"По мышце «{muscle}» пока нет видео 😿")
             return
 
         # Save for paging
-        context.user_data["last_muscle"] = muscle
+        context.user_data["last_idx"] = idx
         context.user_data["last_items"] = items
         context.user_data["page_size"] = 15
 
-        await send_muscle_page(update, context, muscle=muscle, page=0, edit=False)
+        await send_muscle_page(update, context, idx=idx, page=0, edit=False)
         return
 
     await update.message.reply_text("Сначала выбери действие кнопкой 👇", reply_markup=main_keyboard())
@@ -391,17 +469,32 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        _, muscle, page_str = data.split(":", 2)
+        _, idx_str, page_str = data.split(":", 2)
+        idx = int(idx_str)
         page = int(page_str)
+        if idx < 0 or idx >= len(ALLOWED_MUSCLES):
+            return
     except Exception:
         return
 
-    last_muscle = context.user_data.get("last_muscle")
-    if last_muscle != muscle:
-        context.user_data["last_muscle"] = muscle
+    # If state mismatched, refresh from sheet (cheap thanks to cache)
+    last_idx = context.user_data.get("last_idx")
+    if last_idx != idx:
+        muscle = ALLOWED_MUSCLES[idx]
+        context.user_data["last_idx"] = idx
         context.user_data["last_items"] = search_by_muscle(muscle)
+        context.user_data["page_size"] = int(context.user_data.get("page_size", 15))
 
-    await send_muscle_page(update, context, muscle=muscle, page=page, edit=True)
+    await send_muscle_page(update, context, idx=idx, page=page, edit=True)
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # prevents "No error handlers are registered"
+    try:
+        err = context.error
+        print(f"[ERROR] {repr(err)}", flush=True)
+    except Exception:
+        pass
 
 
 async def post_init(app: Application):
@@ -419,6 +512,7 @@ def run():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_error_handler(on_error)
 
     print("Bot is running...", flush=True)
     app.run_polling(drop_pending_updates=True)
